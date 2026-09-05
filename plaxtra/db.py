@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from datetime import datetime
 from sqlalchemy import create_engine, String, Integer, Boolean, Text, DateTime, ForeignKey
@@ -6,7 +7,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker,
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
-engine = create_engine(f"sqlite:///{DATA / 'plaxtra.db'}", connect_args={"check_same_thread": False})
+DATABASE_URL = os.getenv("PLAXTRA_DATABASE_URL", f"sqlite:///{DATA / 'plaxtra.db'}")
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 class Base(DeclarativeBase): pass
