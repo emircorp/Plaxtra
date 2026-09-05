@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from .db import SessionLocal, User, Movie, Series, Season, Episode, Channel, WatchProgress, Favorite, Setting, AuditLog
 from .security import hash_password, verify_password
+from .xtream import XtreamClient, XtreamConfig
 
 router=APIRouter(prefix="/api")
 def db_dep():
@@ -27,6 +28,7 @@ class Progress(BaseModel): media_type:str; media_id:int; position:float; duratio
 class FavoriteIn(BaseModel): media_type:str; media_id:int
 class MovieIn(BaseModel): title:str; synopsis:str=""; year:int|None=None; genre:str=""; poster_url:str=""; backdrop_url:str=""; stream_url:str=""; duration:int|None=None; featured:bool=False
 class ChannelIn(BaseModel): name:str; stream_url:str; group_name:str="General"; logo_url:str=""; epg_id:str=""; number:int|None=None
+class XtreamSource(BaseModel): host:str; username:str; password:str; https:bool=True
 
 @router.get('/health')
 def health(): return {'status':'ok','service':'plaxtra'}
@@ -79,3 +81,36 @@ def setting(key:str,value:str,db:Session=Depends(db_dep),u=Depends(admin)):
     x=db.query(Setting).filter_by(key=key).first() or Setting(key=key); x.value=value; db.add(x); db.commit(); return {'ok':True}
 @router.get('/admin/audit')
 def audit(db:Session=Depends(db_dep),u=Depends(admin)): return [{'actor':x.actor,'action':x.action,'target':x.target,'created_at':x.created_at} for x in db.query(AuditLog).order_by(AuditLog.id.desc()).limit(200).all()]
+
+@router.post('/admin/xtream/test')
+def xtream_test(source:XtreamSource,u=Depends(admin)):
+    try:
+        info=XtreamClient(XtreamConfig(**source.model_dump())).server_info()
+        return {'ok':True,'server_info':info}
+    except Exception as exc: raise HTTPException(400,f'Xtream connection failed: {exc}')
+
+@router.post('/admin/xtream/preview')
+def xtream_preview(source:XtreamSource,u=Depends(admin)):
+    try:
+        c=XtreamClient(XtreamConfig(**source.model_dump()))
+        return {'ok':True,'live_categories':c.live_categories(),'vod_categories':c.vod_categories(),'series_categories':c.series_categories()}
+    except Exception as exc: raise HTTPException(400,f'Xtream connection failed: {exc}')
+
+@router.post('/admin/xtream/import')
+def xtream_import(source:XtreamSource,db:Session=Depends(db_dep),u=Depends(admin)):
+    try:
+        c=XtreamClient(XtreamConfig(**source.model_dump()))
+        live_streams=c.live_streams(); imported_live=0
+        for item in live_streams:
+            sid=item.get('stream_id')
+            if sid is None: continue
+            db.add(Channel(name=item.get('name') or f'Channel {sid}',group_name=item.get('category_name') or '',logo_url=item.get('stream_icon') or '',stream_url=c.live_url(sid),epg_id=item.get('epg_channel_id') or '',number=item.get('num'))); imported_live+=1
+        vod_streams=c.vod_streams(); imported_vod=0
+        for item in vod_streams:
+            sid=item.get('stream_id')
+            if sid is None: continue
+            db.add(Movie(title=item.get('name') or f'VOD {sid}',year=int(item['year']) if str(item.get('year','')).isdigit() else None,genre=item.get('genre') or '',poster_url=item.get('stream_icon') or '',backdrop_url=(item.get('backdrop_path') or [''])[0] if isinstance(item.get('backdrop_path'),list) else (item.get('backdrop_path') or ''),stream_url=c.movie_url(sid, item.get('container_extension') or 'mp4'),duration=None)); imported_vod+=1
+        db.add(AuditLog(actor=u.username,action='import_xtream',target=source.host)); db.commit()
+        return {'ok':True,'live_imported':imported_live,'movies_imported':imported_vod}
+    except Exception as exc:
+        db.rollback(); raise HTTPException(400,f'Xtream import failed: {exc}')
