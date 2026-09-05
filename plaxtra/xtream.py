@@ -20,17 +20,20 @@ class XtreamClient:
         self.config = config
         self.timeout = timeout
 
-    def _request(self, action: str, **params):
-        query = {'username': self.config.username, 'password': self.config.password, 'action': action, **params}
+    def _request(self, action: str | None = None, **params):
+        query = {'username': self.config.username, 'password': self.config.password}
+        if action:
+            query['action'] = action
+        query.update(params)
         with httpx.Client(timeout=self.timeout, follow_redirects=False) as client:
             response = client.get(urljoin(self.config.base_url, 'player_api.php'), params=query)
             response.raise_for_status()
             return response.json()
 
-    def server_info(self): return self._request('')
+    def server_info(self): return self._request()
     def live_categories(self): return self._request('get_live_categories')
     def live_streams(self, category_id=None): return self._request('get_live_streams', **({'category_id': category_id} if category_id else {}))
-    def vod_categories(self): return self._request('get_vod_categories')
+    def vod_categories(self, category_id=None): return self._request('get_vod_categories', **({'category_id': category_id} if category_id else {}))
     def vod_streams(self, category_id=None): return self._request('get_vod_streams', **({'category_id': category_id} if category_id else {}))
     def series_categories(self): return self._request('get_series_categories')
     def series(self, category_id=None): return self._request('get_series', **({'category_id': category_id} if category_id else {}))
