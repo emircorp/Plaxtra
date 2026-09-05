@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from datetime import datetime
-from sqlalchemy import create_engine, String, Integer, Boolean, Text, DateTime, ForeignKey
+from sqlalchemy import create_engine, String, Integer, Boolean, Text, DateTime, ForeignKey, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, relationship
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +35,7 @@ class Movie(Base):
     duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
     featured: Mapped[bool] = mapped_column(Boolean, default=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
 
 class Series(Base):
     __tablename__ = "series"
@@ -46,6 +47,7 @@ class Series(Base):
     poster_url: Mapped[str] = mapped_column(String(500), default="")
     backdrop_url: Mapped[str] = mapped_column(String(500), default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
     seasons: Mapped[list["Season"]] = relationship(back_populates="series", cascade="all, delete-orphan")
 
 class Season(Base):
@@ -54,6 +56,7 @@ class Season(Base):
     series_id: Mapped[int] = mapped_column(ForeignKey("series.id"))
     season_number: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(200), default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
     series: Mapped[Series] = relationship(back_populates="seasons")
     episodes: Mapped[list["Episode"]] = relationship(back_populates="season", cascade="all, delete-orphan")
 
@@ -66,6 +69,7 @@ class Episode(Base):
     synopsis: Mapped[str] = mapped_column(Text, default="")
     stream_url: Mapped[str] = mapped_column(String(1000), default="")
     duration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
     season: Mapped[Season] = relationship(back_populates="episodes")
 
 class Channel(Base):
@@ -78,6 +82,7 @@ class Channel(Base):
     epg_id: Mapped[str] = mapped_column(String(200), default="")
     number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
 
 class Playlist(Base):
     __tablename__ = "playlists"
@@ -118,8 +123,23 @@ class AuditLog(Base):
     target: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+
+def _add_missing_columns():
+    # Small self-contained migration for installs created before metadata_json existed.
+    inspector = inspect(engine)
+    additions = {
+        'movies': 'metadata_json', 'series': 'metadata_json', 'seasons': 'metadata_json',
+        'episodes': 'metadata_json', 'channels': 'metadata_json'
+    }
+    with engine.begin() as conn:
+        for table, column in additions.items():
+            if table in inspector.get_table_names() and column not in {c['name'] for c in inspector.get_columns(table)}:
+                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT \'{{}}\''))
+
+
 def init_db():
     Base.metadata.create_all(engine)
+    _add_missing_columns()
     db = SessionLocal()
     defaults = {"app_name":"Plaxtra", "tagline":"Your media. Your server.", "accent":"#8ea8ff", "attribution":"Powered by Plaxtra"}
     for key, value in defaults.items():
