@@ -1,4 +1,6 @@
 import os
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -9,10 +11,24 @@ from .api import router
 from .features import router as features_router
 from .xtream_api import router as xtream_router
 from .sources import router as sources_router
+from .scheduler import scheduler_loop
 
 BASE=Path(__file__).resolve().parent
 init_db()
-app=FastAPI(title='Plaxtra',version='0.5.0',docs_url='/api/docs',redoc_url='/api/redoc')
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(scheduler_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+app=FastAPI(title='Plaxtra',version='0.5.0',docs_url='/api/docs',redoc_url='/api/redoc',lifespan=lifespan)
 app.add_middleware(SessionMiddleware,secret_key=os.getenv('PLAXTRA_SECRET_KEY','change-me-in-production'),same_site='lax',https_only=os.getenv('PLAXTRA_SECURE_COOKIES','false').lower()=='true')
 app.include_router(router)
 app.include_router(features_router)
