@@ -3,9 +3,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import String, Boolean, Text, DateTime
 from sqlalchemy.orm import Mapped, mapped_column
-from .db import Base, engine, SessionLocal, AuditLog
+import httpx
+from .db import Base, engine, SessionLocal, AuditLog, Channel, Movie, Series, Season, Episode
 from .api import admin
 from .xtream import XtreamClient, XtreamConfig
+from .m3u import parse_m3u
+from .features import public_url
 
 class Source(Base):
     __tablename__ = 'sources'
@@ -103,3 +106,84 @@ def toggle_source(source_id: int, db=Depends(db_dep), u=Depends(admin)):
     if not x: raise HTTPException(404, 'Source not found')
     x.enabled = not x.enabled; db.add(AuditLog(actor=u.username, action='toggle_source', target=x.name)); db.commit()
     return public_source(x)
+
+
+def sync_m3u(source, db):
+    if not public_url(source.source_url):
+        raise HTTPException(400, 'M3U URL must be a public HTTP(S) URL')
+    try:
+        with httpx.Client(timeout=30, follow_redirects=False) as client:
+            response = client.get(source.source_url)
+            response.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(400, f'Playlist fetch failed: {exc}')
+    items = parse_m3u(response.text)
+    if not items:
+        raise HTTPException(400, 'Playlist contains no channels')
+    count = 0
+    for item in items:
+        channel = db.query(Channel).filter_by(name=item.name).first()
+        if not channel:
+            channel = Channel(name=item.name)
+        channel.group_name = item.group
+        channel.logo_url = item.logo
+        channel.stream_url = item.url
+        channel.epg_id = item.tvg_id
+        channel.active = True
+        db.add(channel)
+        count += 1
+    return {'channels': count, 'movies': 0, 'series': 0, 'seasons': 0, 'episodes': 0}
+
+
+def sync_xtream(source, db):
+    client = XtreamClient(XtreamConfig(host=source.host, username=source.username, password=source.secret, https=source.https))
+    counts = {'channels': 0, 'movies': 0, 'series': 0, 'seasons': 0, 'episodes': 0}
+    try:
+        for item in client.live_streams():
+            channel = db.query(Channel).filter_by(stream_url=client.live_url(item.get('stream_id'))).first()
+            if not channel: channel = Channel(name=str(item.get('name') or 'Untitled channel'))
+            channel.name = str(item.get('name') or channel.name); channel.group_name = str(item.get('category_name') or 'Live TV')
+            channel.logo_url = str(item.get('stream_icon') or ''); channel.stream_url = client.live_url(item.get('stream_id'))
+            channel.epg_id = str(item.get('epg_channel_id') or ''); channel.number = item.get('num'); channel.active = True
+            db.add(channel); counts['channels'] += 1
+        for item in client._request('get_vod_streams'):
+            stream_id = item.get('stream_id'); url = client.movie_url(stream_id)
+            movie = db.query(Movie).filter_by(stream_url=url).first()
+            if not movie: movie = Movie(title=str(item.get('name') or 'Untitled movie'))
+            movie.title = str(item.get('name') or movie.title); movie.poster_url = str(item.get('stream_icon') or '')
+            movie.stream_url = url; movie.active = True; movie.year = item.get('year'); movie.genre = str(item.get('genre') or '')
+            db.add(movie); counts['movies'] += 1
+        for item in client.series():
+            ext_id = item.get('series_id'); title = str(item.get('name') or 'Untitled series')
+            series = db.query(Series).filter_by(title=title).first()
+            if not series: series = Series(title=title)
+            series.poster_url = str(item.get('cover') or ''); series.backdrop_url = str(item.get('backdrop_path') or '')
+            series.synopsis = str(item.get('plot') or ''); series.year = item.get('releaseDate') or item.get('year'); series.genre = str(item.get('genre') or '')
+            series.active = True; db.add(series); db.flush(); counts['series'] += 1
+            info = client.series_info(int(ext_id))
+            for season_number, episodes in (info.get('episodes') or {}).items():
+                sn = int(season_number)
+                season = db.query(Season).filter_by(series_id=series.id, season_number=sn).first()
+                if not season: season = Season(series_id=series.id, season_number=sn, title=f'Season {sn}')
+                db.add(season); db.flush(); counts['seasons'] += 1
+                for ep in episodes or []:
+                    stream_id = ep.get('id') or ep.get('stream_id'); url = client.series_episode_url(stream_id)
+                    episode = db.query(Episode).filter_by(season_id=season.id, episode_number=int(ep.get('episode_num') or 0)).first()
+                    if not episode: episode = Episode(season_id=season.id, episode_number=int(ep.get('episode_num') or 0), title=str(ep.get('title') or 'Episode'))
+                    episode.title = str(ep.get('title') or episode.title); episode.synopsis = str(ep.get('plot') or ''); episode.stream_url = url
+                    episode.duration = ep.get('duration_secs') or ep.get('duration'); db.add(episode); counts['episodes'] += 1
+    except Exception as exc:
+        raise HTTPException(400, f'Xtream sync failed: {exc}')
+    return counts
+
+@router.post('/{source_id}/sync')
+def sync_source(source_id: int, db=Depends(db_dep), u=Depends(admin)):
+    source = db.get(Source, source_id)
+    if not source: raise HTTPException(404, 'Source not found')
+    if not source.enabled: raise HTTPException(409, 'Source is disabled')
+    counts = sync_m3u(source, db) if source.source_type == 'm3u' else sync_xtream(source, db)
+    source.last_sync = datetime.utcnow()
+    db.add(source)
+    db.add(AuditLog(actor=u.username, action='sync_source', target=source.name))
+    db.commit()
+    return {'ok': True, 'source': source.name, 'synced_at': source.last_sync, **counts}
