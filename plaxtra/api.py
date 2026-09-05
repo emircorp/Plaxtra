@@ -1,6 +1,6 @@
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from .db import SessionLocal, User, Movie, Series, Season, Episode, Channel, WatchProgress, Favorite, Setting, AuditLog
 from .security import hash_password, verify_password
@@ -24,8 +24,8 @@ def admin(user=Depends(current_user)):
     return user
 
 class Credentials(BaseModel): username:str; password:str
-class Progress(BaseModel): media_type:str; media_id:int; position:float; duration:float=0
-class FavoriteIn(BaseModel): media_type:str; media_id:int
+class Progress(BaseModel): media_type:str=Field(pattern='^(movie|episode)$'); media_id:int; position:float; duration:float=0
+class FavoriteIn(BaseModel): media_type:str=Field(pattern='^(movie|series|episode)$'); media_id:int
 class MovieIn(BaseModel): title:str; synopsis:str=""; year:int|None=None; genre:str=""; poster_url:str=""; backdrop_url:str=""; stream_url:str=""; duration:int|None=None; featured:bool=False
 class ChannelIn(BaseModel): name:str; stream_url:str; group_name:str="General"; logo_url:str=""; epg_id:str=""; number:int|None=None
 class XtreamSource(BaseModel): host:str; username:str; password:str; https:bool=True
@@ -48,11 +48,20 @@ def login(c:Credentials,request:Request,db:Session=Depends(db_dep)):
 def logout(request:Request): request.session.clear(); return {'ok':True}
 @router.get('/auth/me')
 def me(u=Depends(current_user)): return {'id':u.id,'username':u.username,'role':u.role}
+
+def movie_dict(m): return {'id':m.id,'title':m.title,'synopsis':m.synopsis,'year':m.year,'genre':m.genre,'poster_url':m.poster_url,'backdrop_url':m.backdrop_url,'stream_url':m.stream_url,'duration':m.duration,'featured':m.featured}
+def series_dict(s): return {'id':s.id,'title':s.title,'synopsis':s.synopsis,'year':s.year,'genre':s.genre,'poster_url':s.poster_url,'backdrop_url':s.backdrop_url}
+
 @router.get('/catalog')
 def catalog(db:Session=Depends(db_dep)):
-    return {'movies':[{'id':m.id,'title':m.title,'year':m.year,'genre':m.genre,'poster_url':m.poster_url,'backdrop_url':m.backdrop_url,'stream_url':m.stream_url,'featured':m.featured} for m in db.query(Movie).filter_by(active=True).all()], 'series':[{'id':s.id,'title':s.title,'year':s.year,'genre':s.genre,'poster_url':s.poster_url} for s in db.query(Series).filter_by(active=True).all()]}
+    return {'movies':[movie_dict(m) for m in db.query(Movie).filter_by(active=True).all()], 'series':[series_dict(s) for s in db.query(Series).filter_by(active=True).all()]}
 @router.get('/movies')
 def movies(db:Session=Depends(db_dep)): return catalog(db)['movies']
+@router.get('/movies/{movie_id}')
+def movie_detail(movie_id:int,db:Session=Depends(db_dep)):
+    m=db.get(Movie,movie_id)
+    if not m or not m.active: raise HTTPException(404,'Movie not found')
+    return movie_dict(m)
 @router.post('/admin/movies')
 def add_movie(m:MovieIn,db:Session=Depends(db_dep),u=Depends(admin)):
     x=Movie(**m.model_dump()); db.add(x); db.add(AuditLog(actor=u.username,action='create_movie',target=m.title)); db.commit(); return {'id':x.id}
@@ -61,19 +70,36 @@ def live(db:Session=Depends(db_dep)): return [{'id':c.id,'name':c.name,'group':c
 @router.post('/admin/channels')
 def add_channel(c:ChannelIn,db:Session=Depends(db_dep),u=Depends(admin)):
     x=Channel(**c.model_dump()); db.add(x); db.add(AuditLog(actor=u.username,action='create_channel',target=c.name)); db.commit(); return {'id':x.id}
+
 @router.post('/progress')
 def progress(p:Progress,u=Depends(current_user),db:Session=Depends(db_dep)):
     x=db.query(WatchProgress).filter_by(user_id=u.id,media_type=p.media_type,media_id=p.media_id).first()
     if not x: x=WatchProgress(user_id=u.id,media_type=p.media_type,media_id=p.media_id); db.add(x)
     x.position=max(0,p.position); x.duration=max(0,p.duration); x.updated_at=datetime.utcnow(); db.commit(); return {'ok':True}
+
+@router.get('/progress')
+def progress_list(u=Depends(current_user),db:Session=Depends(db_dep)):
+    rows=db.query(WatchProgress).filter_by(user_id=u.id).order_by(WatchProgress.updated_at.desc()).limit(50).all()
+    out=[]
+    for x in rows:
+        if x.media_type=='movie':
+            m=db.get(Movie,x.media_id)
+            if m and m.active: out.append({'media_type':x.media_type,'media_id':x.media_id,'title':m.title,'poster_url':m.poster_url,'position':x.position,'duration':x.duration,'percent':round((x.position/x.duration)*100,1) if x.duration else 0,'updated_at':x.updated_at})
+        elif x.media_type=='episode':
+            e=db.get(Episode,x.media_id)
+            if e: out.append({'media_type':x.media_type,'media_id':x.media_id,'title':e.title,'poster_url':'','position':x.position,'duration':x.duration,'percent':round((x.position/x.duration)*100,1) if x.duration else 0,'updated_at':x.updated_at})
+    return out
+
 @router.get('/favorites')
-def favorites(u=Depends(current_user),db:Session=Depends(db_dep)): return [{'media_type':x.media_type,'media_id':x.media_id} for x in db.query(Favorite).filter_by(user_id=u.id).all()]
+def favorites(u=Depends(current_user),db:Session=Depends(db_dep)):
+    return [{'media_type':x.media_type,'media_id':x.media_id} for x in db.query(Favorite).filter_by(user_id=u.id).all()]
 @router.post('/favorites/toggle')
 def favorite(f:FavoriteIn,u=Depends(current_user),db:Session=Depends(db_dep)):
     x=db.query(Favorite).filter_by(user_id=u.id,media_type=f.media_type,media_id=f.media_id).first()
     if x: db.delete(x); state=False
     else: db.add(Favorite(user_id=u.id,**f.model_dump())); state=True
     db.commit(); return {'favorite':state}
+
 @router.get('/admin/settings')
 def settings(db:Session=Depends(db_dep),u=Depends(admin)): return {x.key:x.value for x in db.query(Setting).all()}
 @router.put('/admin/settings/{key}')
